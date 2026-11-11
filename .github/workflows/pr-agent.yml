@@ -115,6 +115,9 @@ jobs:
           config.custom_model_max_tokens: "1000000"
           config.max_model_tokens: "32000"
           config.enable_claude_adaptive_thinking: "false"
+          # Haiku 5.5 rejects the temperature setting ("deprecated for this model"),
+          # which made the PR summary fall back to Sonnet 5.
+          config.no_temperature_models: '["claude-haiku-5-5"]'
           # What runs automatically when a PR opens or is marked ready.
           github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
           github_action_config.auto_review: "true"
