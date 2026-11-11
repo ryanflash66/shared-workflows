@@ -1,0 +1,134 @@
+name: PR Agent review (shared)
+
+# Shared reviewer for all of Ryan's repos. Each repo calls this file with a
+# short workflow (see README.md), so a fix here applies everywhere.
+#
+# Runs Qodo's open-source PR-Agent with Ryan's own Anthropic key.
+# Cost guards: no run on every push, drafts and bots skipped, fork PRs
+# skipped, comment commands limited to the repo owner, prompts capped at
+# 32k tokens, at most 2 code-suggestion calls per PR.
+#
+# Settings set here as env vars win over a repo's .pr_agent.toml (PR-Agent
+# re-applies env vars after loading repo files). So a repo's .pr_agent.toml
+# must not set pr_reviewer.extra_instructions: pass `focus` instead.
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Security profile: research, web, or general (core rules only)"
+        type: string
+        required: true
+      focus:
+        description: "What this repo's reviews should prioritize (plain text)"
+        type: string
+        required: false
+        default: ""
+      model:
+        description: "Model for /review and /improve"
+        type: string
+        required: false
+        default: "anthropic/claude-sonnet-5-5"
+    secrets:
+      ANTHROPIC_KEY:
+        required: true
+
+env:
+  RULES_CORE: |
+    Security section (rules adapted from Cloudflare's security-audit skill,
+    github.com/cloudflare/security-audit-skill, MIT):
+    Report a security concern only when you can name who controls the input,
+    what that input is, which check it gets past, and the concrete result.
+    If you cannot, answer No. A missing best practice or a defense-in-depth gap
+    is not a security concern. In every repo, look for changes that add:
+    - secrets, API keys, tokens, personal absolute paths or private data in
+      code, configs, notebooks, docs or committed .env files
+    - workflow changes under .github/: pull_request_target or workflow_run
+      triggers, PR titles, branch names or comment text used inside run: steps,
+      actions not pinned to a release or commit, wider permissions, or secrets
+      reachable from fork PRs or non-owners
+    - shell commands (subprocess, os.system, exec, child_process) built from
+      user input, file names or other untrusted strings
+  RULES_RESEARCH: |
+    This is research code. Also look for changes that add:
+    - loading of files from outside the repo or pipeline in a way that can run
+      code: pickle, np.load(allow_pickle=True), torch.load without
+      weights_only=True, yaml.load without a safe loader. Do not flag these on
+      files the pipeline writes itself.
+    - code or weights fetched at run time (torch.hub.load, pip installs,
+      downloads) without a pinned commit, version or hash
+  RULES_WEB: |
+    This is a web app or site. Also look for changes that add:
+    - server routes, API handlers, server actions or serverless functions that
+      read or change data without checking who the user is and that they own it
+    - user input reaching database queries, HTML (innerHTML,
+      dangerouslySetInnerHTML, Astro set:html), file paths, redirects or
+      server-side fetches of user-supplied URLs without validation
+    - secret keys in browser code or public env vars (NEXT_PUBLIC_, PUBLIC_,
+      VITE_): Anthropic, OpenAI, Stripe, PayPal secrets, Supabase service_role
+    - Supabase tables or storage reachable from the browser without row level
+      security, or the service_role key used client side
+    - payment or webhook handlers that trust client-sent prices or amounts, or
+      skip signature or order verification with the provider
+    - CORS that allows any origin with credentials, or session cookies without
+      HttpOnly and Secure
+    - LLM features where model output is rendered as HTML, or user or web
+      content can trigger tool calls, payments or data changes without a check
+      (prompt injection)
+
+jobs:
+  pr_agent:
+    # Bots, drafts and fork PRs (which get no secrets) never start a run.
+    # Only the repo owner can start a paid run from a comment like "/review".
+    if: >-
+      github.event.sender.type != 'Bot' && (
+        (github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+         github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+         github.event.comment.author_association == 'OWNER' &&
+         startsWith(github.event.comment.body, '/'))
+      )
+    # Job-level so skipped runs (ordinary comments) never displace a queued review.
+    concurrency:
+      group: pr-agent-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Can only narrow what the calling repo grants, never widen it.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: PR Agent
+        # Pinned release image, not the rolling @main, because this job holds the API key.
+        uses: docker://pragent/pr-agent:0.49.0-github_action
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC.KEY: ${{ secrets.ANTHROPIC_KEY }}
+          # Models: Sonnet for review and code suggestions, Haiku for the PR summary.
+          config.model: ${{ inputs.model }}
+          config.model_weak: "anthropic/claude-haiku-5-5"
+          config.fallback_models: '["anthropic/claude-sonnet-5"]'
+          # 0.49.0 predates Sonnet 5.5 and Haiku 5.5 in its model table, so give their
+          # window here; max_model_tokens still caps every prompt at 32k tokens.
+          config.custom_model_max_tokens: "1000000"
+          config.max_model_tokens: "32000"
+          config.enable_claude_adaptive_thinking: "false"
+          # What runs automatically when a PR opens or is marked ready.
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
+          github_action_config.auto_review: "true"
+          github_action_config.auto_improve: "true"
+          github_action_config.auto_describe: "true"
+          # Post the summary as a comment so the PR description is never overwritten.
+          pr_description.publish_description_as_comment: "true"
+          # Same for every repo: security section on, suggestion calls capped.
+          pr_reviewer.require_security_review: "true"
+          pr_code_suggestions.max_number_of_calls: "2"
+          pr_code_suggestions.focus_only_on_problems: "true"
+          pr_reviewer.extra_instructions: |
+            ${{ inputs.focus }}
+            Skip style nits.
+
+            ${{ env.RULES_CORE }}
+            ${{ inputs.profile == 'research' && env.RULES_RESEARCH || inputs.profile == 'web' && env.RULES_WEB || '' }}

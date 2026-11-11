@@ -1,0 +1,22 @@
+# Copy to .github/workflows/pr-agent.yml in a research repo.
+# All the logic lives in ryanflash66/shared-workflows; this file only picks the profile.
+name: PR Agent review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    uses: ryanflash66/shared-workflows/.github/workflows/pr-agent.yml@main
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    secrets:
+      ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
+    with:
+      profile: research
+      focus: ""
